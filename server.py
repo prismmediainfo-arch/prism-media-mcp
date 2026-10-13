@@ -16,7 +16,11 @@ import os
 import re
 import time
 
+from urllib.parse import urlparse
+from xml.sax.saxutils import escape
+
 import httpx
+from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
 
 API = os.getenv("PRISM_API_URL", "https://prismmedia.org/api/v1").rstrip("/")
@@ -493,6 +497,410 @@ def get_institute_info(topic: str = "") -> dict:
     else:
         return info
     return {k: info[k] for k in keys}
+
+
+# ======================================================================
+# SEO tools: audit pages, structured data, sitemap, internal links, content gaps.
+# They only read public pages / the public API and never change the site.
+# ======================================================================
+_HOST = urlparse(SITE).hostname or "prismmedia.org"
+ALLOWED_AUDIT_HOSTS = {_HOST, f"www.{_HOST}"}
+SEVERITY_COST = {"critical": 25, "error": 15, "warning": 8, "info": 3}
+GENERIC_WORDS = {"diploma", "certification", "professional", "specialization", "program", "bachelor", "degree", "ug", "bsc"}
+ORG_ID = f"{SITE}/#organization"
+ORGANIZATION = {
+    "@context": "https://schema.org",
+    "@type": "EducationalOrganization",
+    "@id": ORG_ID,
+    "name": "Prism Media",
+    "alternateName": "Prism Media Animation Institute Bhubaneswar",
+    "url": SITE,
+    "logo": f"{SITE}/assets/content/Logo.png",
+    "description": "Creative education institute for Animation, VFX, Graphic Design, UI/UX, Digital Marketing and AI in Bhubaneswar, Odisha.",
+    "foundingDate": "2014",
+    "telephone": "+91-94371-52172",
+    "email": "infoprismmediaodisha@gmail.com",
+    "address": {
+        "@type": "PostalAddress",
+        "streetAddress": "Plot No.20, Acharya Vihar Square, Near Acharya Vihar Bus Stop",
+        "addressLocality": "Bhubaneswar",
+        "addressRegion": "Odisha",
+        "postalCode": "751022",
+        "addressCountry": "IN",
+    },
+    "areaServed": "Bhubaneswar, Odisha",
+    "sameAs": list(INSTITUTE["social"].values()),
+}
+ORG_REF = {"@type": "EducationalOrganization", "@id": ORG_ID, "name": "Prism Media", "url": SITE}
+STATIC_PAGES = ["/", "/about-us", "/blog", "/gallery", "/careers", "/contact-us", "/talenthub",
+                "/student-testimonials", "/students-certificates", "/game"]
+
+
+def _all_posts() -> list:
+    posts, page = [], 1
+    while page <= 60:
+        data = _get("/blog/posts", {"page": page, "per_page": 50}) or {}
+        posts.extend(data.get("posts") or [])
+        if page >= (data.get("pages") or 1):
+            break
+        page += 1
+    return posts
+
+
+def _abs(url):
+    if not url:
+        return None
+    return url if url.startswith("http") else f"{SITE}{url if url.startswith('/') else '/' + url}"
+
+
+def _iso_duration(text):
+    """'18 Months' -> 'P18M', '1 Year 6 Months' -> 'P1Y6M'."""
+    units = {"year": "Y", "month": "M", "week": "W", "day": "D"}
+    found = {}
+    for n, unit in re.findall(r"(\d+)\s*(year|month|week|day)s?", (text or "").lower()):
+        found[units[unit]] = n
+    return ("P" + "".join(f"{found[u]}{u}" for u in "YMWD" if u in found)) if found else None
+
+
+def _fetch_page(url: str):
+    with httpx.Client(timeout=30, follow_redirects=True, headers={"User-Agent": "PrismMediaSEO/1.0"}) as client:
+        r = client.get(url)
+        return r.status_code, str(r.url), r.text
+
+
+def _norm_url(url: str) -> str:
+    return re.sub(r"^https?://(www\.)?", "", url or "").rstrip("/").lower()
+
+
+def _audit_html(final_url: str, status: int, html: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    issues = []
+
+    def add(sev, check, message, fix):
+        issues.append({"severity": sev, "check": check, "message": message, "fix": fix})
+
+    if status != 200:
+        add("critical", "status", f"Page returned HTTP {status}.", "Make sure the URL returns 200 for crawlers.")
+
+    title = (soup.title.string or "").strip() if soup.title and soup.title.string else ""
+    if not title:
+        add("error", "title", "No <title> tag.", "Add a unique title of 30-60 characters with the main keyword.")
+    elif len(title) < 30 or len(title) > 60:
+        add("warning", "title", f"Title is {len(title)} characters.", "Aim for 30-60 so Google doesn't truncate it.")
+
+    md = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
+    desc = (md.get("content") or "").strip() if md else ""
+    if not desc:
+        add("error", "meta_description", "No meta description.", "Add a unique 70-160 character description that invites the click.")
+    elif len(desc) < 70 or len(desc) > 160:
+        add("warning", "meta_description", f"Meta description is {len(desc)} characters.", "Aim for 70-160 characters.")
+
+    canon = soup.find("link", rel="canonical")
+    canon_href = (canon.get("href") or "").strip() if canon else ""
+    if not canon_href:
+        add("warning", "canonical", "No canonical link.", "Add <link rel=\"canonical\"> pointing to the preferred URL.")
+    elif _norm_url(canon_href) != _norm_url(final_url):
+        add("warning", "canonical", f"Canonical ({canon_href}) differs from the page URL.", "Check that this is intentional.")
+
+    robots = soup.find("meta", attrs={"name": re.compile("^robots$", re.I)})
+    if robots and "noindex" in (robots.get("content") or "").lower():
+        add("critical", "noindex", "Page has a noindex robots tag.", "Remove noindex if the page should appear in Google.")
+
+    h1s = [h.get_text(" ", strip=True) for h in soup.find_all("h1")]
+    if not h1s:
+        add("error", "h1", "No <h1> heading.", "Add one H1 that describes the page.")
+    elif len(h1s) > 1:
+        add("warning", "h1", f"{len(h1s)} H1 headings.", "Use a single H1 and H2/H3 for sections.")
+
+    if not soup.find("meta", attrs={"name": "viewport"}):
+        add("warning", "viewport", "No viewport meta tag.", "Add width=device-width for mobile-friendliness.")
+    if not (soup.html and soup.html.get("lang")):
+        add("info", "lang", "No lang attribute on <html>.", "Add lang=\"en\".")
+
+    imgs = soup.find_all("img")
+    no_alt = [i for i in imgs if not (i.get("alt") or "").strip()]
+    if no_alt:
+        add("warning", "image_alt", f"{len(no_alt)} of {len(imgs)} images have no alt text.", "Add short descriptive alt text.")
+
+    ld_types = []
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+        except ValueError:
+            add("error", "structured_data", "A JSON-LD block is not valid JSON.", "Fix the JSON syntax.")
+            continue
+        for node in (data if isinstance(data, list) else [data]):
+            nodes = node.get("@graph", [node]) if isinstance(node, dict) else []
+            ld_types += [str(n.get("@type")) for n in nodes if isinstance(n, dict)]
+    if not ld_types:
+        add("warning", "structured_data", "No structured data (JSON-LD) found.", "Add Course/Article/Organization schema (see get_course_schema).")
+
+    missing_og = [p for p in ("og:title", "og:description", "og:image") if not soup.find("meta", property=p)]
+    if missing_og:
+        add("info", "open_graph", f"Missing Open Graph tags: {', '.join(missing_og)}.", "Add them for better link previews.")
+
+    body = soup.body or soup
+    for t in body(["script", "style", "noscript"]):
+        t.decompose()
+    words = len(body.get_text(" ", strip=True).split())
+    root = soup.find(id="root")
+    if words < 150:
+        spa = root is not None and len(root.get_text(strip=True)) < 50
+        add(
+            "critical" if spa else "warning",
+            "content",
+            f"Only {words} words in the HTML a crawler downloads"
+            + (" (empty React root: content is added by JavaScript)." if spa else "."),
+            "Prerender or server-render this page so Google and AI crawlers see the content without running JavaScript.",
+        )
+
+    host = (urlparse(final_url).hostname or "").lower()
+    internal = [a["href"] for a in soup.find_all("a", href=True) if a["href"].startswith("/") or host in a["href"]]
+    if len(internal) < 3:
+        add("warning", "internal_links", f"Only {len(internal)} internal links in the HTML.", "Link to related courses and posts with descriptive anchor text.")
+
+    score = max(0, 100 - sum(SEVERITY_COST[i["severity"]] for i in issues))
+    return {
+        "url": final_url,
+        "status": status,
+        "score": score,
+        "metrics": {"title": title, "title_length": len(title), "meta_description_length": len(desc), "h1": h1s,
+                    "word_count": words, "images": len(imgs), "images_missing_alt": len(no_alt),
+                    "structured_data_types": ld_types, "internal_links": len(internal)},
+        "issues": sorted(issues, key=lambda i: list(SEVERITY_COST).index(i["severity"])),
+        "note": "Checked the raw HTML a crawler downloads; JavaScript is not executed.",
+    }
+
+
+@mcp.tool()
+def seo_audit_page(url: str = "") -> dict:
+    """Audit one prismmedia.org page for on-page SEO: title, description, headings, canonical, structured data,
+    image alt text, internal links, and whether crawlers can see the content without JavaScript.
+
+    Args:
+        url: Full page URL on prismmedia.org. Defaults to the home page.
+    """
+    url = url or f"{SITE}/"
+    u = urlparse(url)
+    if u.scheme not in ("http", "https") or (u.hostname or "").lower() not in ALLOWED_AUDIT_HOSTS:
+        return {"error": f"Only pages on {', '.join(sorted(ALLOWED_AUDIT_HOSTS))} can be audited."}
+    try:
+        status, final_url, html = _fetch_page(url)
+    except httpx.HTTPError as e:
+        return {"error": f"Could not fetch {url}: {e}"}
+    return _audit_html(final_url, status, html)
+
+
+def _sitemap_entries() -> list:
+    entries = {f"{SITE}{p}": None for p in STATIC_PAGES}
+    for c in _all_courses():
+        entries[_course_url(c)] = None
+    for p in _all_posts():
+        if p.get("slug"):
+            entries[f"{SITE}/blog/{p['slug']}"] = (p.get("published_date") or "")[:10] or None
+    return list(entries.items())
+
+
+@mcp.tool()
+def seo_audit_site(limit: int = 10) -> dict:
+    """Audit several pages from the sitemap (home, main pages, courses, blog) and summarise the most common problems.
+
+    Args:
+        limit: How many pages to audit (default 10, max 30). Pages are taken in sitemap order.
+    """
+    limit = max(1, min(limit, 30))
+    try:
+        urls = [u for u, _ in _sitemap_entries()][:limit]
+    except httpx.HTTPError as e:
+        return {"error": f"Prism Media API unavailable: {e}"}
+    results = []
+    for u in urls:
+        try:
+            status, final_url, html = _fetch_page(u)
+            results.append(_audit_html(final_url, status, html))
+        except httpx.HTTPError as e:
+            results.append({"url": u, "error": str(e), "score": 0, "issues": []})
+    results.sort(key=lambda r: r["score"])
+    by_check: dict = {}
+    for r in results:
+        for i in r["issues"]:
+            by_check[i["check"]] = by_check.get(i["check"], 0) + 1
+    return {
+        "pages_audited": len(results),
+        "average_score": round(sum(r["score"] for r in results) / max(len(results), 1)),
+        "most_common_issues": dict(sorted(by_check.items(), key=lambda kv: -kv[1])),
+        "pages_worst_first": [
+            {"url": r["url"], "score": r["score"], "error": r.get("error"),
+             "issues": [f"{i['severity']}: {i['message']}" for i in r["issues"]]}
+            for r in results
+        ],
+    }
+
+
+@mcp.tool()
+def get_organization_schema() -> dict:
+    """JSON-LD (EducationalOrganization) for Prism Media. Paste into the site's <head> inside <script type="application/ld+json">."""
+    return ORGANIZATION
+
+
+@mcp.tool()
+def get_course_schema(slug: str, include_price: bool = False) -> dict:
+    """JSON-LD for a course page (Course, plus FAQPage when the course has FAQs).
+
+    Args:
+        slug: Course slug from search_courses.
+        include_price: Add an Offer with the fee. Only enable if the page shows the same price.
+    """
+    try:
+        c = next((x for x in _all_courses() if x.get("slug") == slug), None)
+    except httpx.HTTPError as e:
+        return {"error": f"Course API unavailable: {e}"}
+    if not c:
+        return {"error": f"No active course with slug '{slug}'."}
+    course = {
+        "@type": "Course",
+        "name": c.get("name"),
+        "description": c.get("short_description") or c.get("description") or c.get("name"),
+        "url": _course_url(c),
+        "inLanguage": c.get("language") or "en",
+        "provider": ORG_REF,
+        "hasCourseInstance": {"@type": "CourseInstance", "courseMode": "onsite", "location": ORGANIZATION["address"]},
+    }
+    if c.get("level"):
+        course["educationalLevel"] = str(c["level"]).capitalize()
+    if c.get("image_url"):
+        course["image"] = _abs(c["image_url"])
+    iso = _iso_duration(c.get("duration"))
+    if iso:
+        course["timeRequired"] = iso
+        course["hasCourseInstance"]["courseWorkload"] = iso
+    price = c.get("discount_price") or c.get("price")
+    if include_price and price and price > 0:
+        course["offers"] = {"@type": "Offer", "price": price, "priceCurrency": "INR", "category": "Paid"}
+    graph = [course]
+    syllabus = _maybe_json(c.get("syllabus"))
+    faqs = syllabus.get("faqs") if isinstance(syllabus, dict) else None
+    faqs = [f for f in (faqs or []) if f.get("question") and f.get("answer")]
+    if faqs:
+        graph.append({"@type": "FAQPage", "mainEntity": [
+            {"@type": "Question", "name": f["question"], "acceptedAnswer": {"@type": "Answer", "text": f["answer"]}}
+            for f in faqs]})
+    return {"@context": "https://schema.org", "@graph": graph}
+
+
+@mcp.tool()
+def get_blog_schema(slug: str) -> dict:
+    """JSON-LD (BlogPosting) for a blog post.
+
+    Args:
+        slug: Post slug from list_blog_posts.
+    """
+    try:
+        p = next((x for x in _all_posts() if x.get("slug") == slug), None)
+    except httpx.HTTPError as e:
+        return {"error": f"Blog API unavailable: {e}"}
+    if not p:
+        return {"error": f"No blog post with slug '{slug}'."}
+    url = f"{SITE}/blog/{slug}"
+    data = {
+        "@context": "https://schema.org", "@type": "BlogPosting",
+        "headline": (p.get("title") or "")[:110], "description": p.get("excerpt") or "",
+        "mainEntityOfPage": {"@type": "WebPage", "@id": url}, "url": url,
+        "author": {"@type": "Organization", "name": "Prism Media", "url": SITE}, "publisher": ORG_REF,
+    }
+    if p.get("published_date"):
+        data["datePublished"] = data["dateModified"] = p["published_date"]
+    if p.get("featured_image"):
+        data["image"] = _abs(p["featured_image"])
+    if p.get("category"):
+        data["articleSection"] = p["category"]
+    return data
+
+
+@mcp.tool()
+def generate_sitemap() -> dict:
+    """Generate sitemap.xml content for prismmedia.org: main pages, every active course and every blog post."""
+    try:
+        entries = _sitemap_entries()
+    except httpx.HTTPError as e:
+        return {"error": f"Prism Media API unavailable: {e}"}
+    rows = []
+    for loc, lastmod in entries:
+        rows.append("  <url>\n    <loc>" + escape(loc) + "</loc>\n"
+                    + (f"    <lastmod>{lastmod}</lastmod>\n" if lastmod else "") + "  </url>")
+    xml = ('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+           + "\n".join(rows) + "\n</urlset>\n")
+    return {"url_count": len(entries), "sitemap_xml": xml}
+
+
+def _name_tokens(course: dict) -> set:
+    return {t for t in _tokens(course.get("name") or "") if t not in GENERIC_WORDS}
+
+
+@mcp.tool()
+def suggest_internal_links(limit: int = 30) -> dict:
+    """Suggest links from blog posts to the courses they are about (internal links help rankings and sales).
+    Based on matching course names against post titles and excerpts. Check the post doesn't already link to the course.
+
+    Args:
+        limit: Max suggestions (default 30).
+    """
+    try:
+        courses, posts = _all_courses(), _all_posts()
+    except httpx.HTTPError as e:
+        return {"error": f"Prism Media API unavailable: {e}"}
+    suggestions = []
+    for p in posts:
+        ptoks = set(_tokens(f"{p.get('title') or ''} {p.get('excerpt') or ''}"))
+        scored = []
+        for c in courses:
+            hits = _name_tokens(c) & ptoks
+            if hits:
+                scored.append((len(hits), c, sorted(hits)))
+        scored.sort(key=lambda x: -x[0])
+        for score, c, hits in scored[:2]:
+            suggestions.append({
+                "score": score,
+                "post": p.get("title"),
+                "post_url": f"{SITE}/blog/{p.get('slug')}",
+                "link_to": _course_url(c),
+                "suggested_anchor_text": c.get("name"),
+                "matched_terms": hits,
+            })
+    suggestions.sort(key=lambda s: -s["score"])
+    return {"count": len(suggestions[:limit]), "suggestions": suggestions[:limit]}
+
+
+@mcp.tool()
+def find_content_gaps(limit: int = 10) -> dict:
+    """Show which courses have the least blog support, with blog topic ideas for each.
+    Ideas are templates to adapt; they are not search-volume data, so check them in Google Search Console or a keyword tool.
+
+    Args:
+        limit: How many courses to list (default 10), least covered first.
+    """
+    try:
+        courses, posts = _all_courses(), _all_posts()
+    except httpx.HTTPError as e:
+        return {"error": f"Prism Media API unavailable: {e}"}
+    post_tokens = [set(_tokens(f"{p.get('title') or ''} {p.get('excerpt') or ''}")) for p in posts]
+    rows = []
+    for c in courses:
+        nt = _name_tokens(c)
+        count = sum(1 for pt in post_tokens if nt and nt & pt)
+        name = c.get("name")
+        rows.append({
+            "course": name,
+            "url": _course_url(c),
+            "related_posts": count,
+            "topic_ideas": [
+                f"{name} in Bhubaneswar: syllabus, fees, eligibility and career options",
+                f"Career options and salaries after {name}",
+                f"Is {name} worth it? Who should join and what you will learn",
+            ],
+        })
+    rows.sort(key=lambda r: r["related_posts"])
+    return {"posts_checked": len(posts), "courses": rows[:limit]}
 
 
 if __name__ == "__main__":

@@ -18,6 +18,21 @@ It never writes to the API.
 | `get_testimonials` | Approved student testimonials |
 | `get_institute_info` | Address, contact, affiliations, placement stats, page links |
 
+### SEO tools (help find and fix ranking problems)
+
+| Tool | What it does |
+|---|---|
+| `seo_audit_page` | Audits one prismmedia.org page: title, meta description, H1, canonical, alt text, structured data, empty-React-page check; score 0-100 with fixes |
+| `seo_audit_site` | Audits the home page plus key course pages and ranks the worst first |
+| `get_organization_schema` | Ready-to-paste JSON-LD for the institute |
+| `get_course_schema` | JSON-LD for a course (price only if `include_price=true`) |
+| `get_blog_schema` | JSON-LD BlogPosting for a post |
+| `generate_sitemap` | sitemap.xml built from live courses and blog posts |
+| `suggest_internal_links` | Which blog posts should link to which course pages |
+| `find_content_gaps` | Courses with the fewest blog posts, with post ideas |
+
+These tools suggest and check; they do not change the website. Topic ideas are not search-volume data.
+
 ## Run locally
 
     pip install -r requirements.txt
